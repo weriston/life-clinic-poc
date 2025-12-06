@@ -1,4 +1,4 @@
-# Life Clinic POC - Desafio Líder de Soluções (Colibri)
+# Life Clinic POC
 
 Plataforma digital para tratamento de infertilidade com IA para rede de acolhimento inteligente. Este é um POC (Proof of Concept) completo, desenvolvido buscando atender ao escopo definido. Foco em inovação "Lovable" (IA simples e escalável), web-first, compliant LGPD (dados mock anonimizados).
 
