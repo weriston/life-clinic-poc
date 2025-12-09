@@ -1,0 +1,48 @@
+{
+  "name": "life-clinic-frontend",
+  "version": "1.0.0",
+  "description": "Frontend React para Life Clinic POC",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "dependencies": {
+    "date-fns": "^2.30.0",
+    "leaflet": "^1.9.4",
+    "react": "^17.0.2",
+    "react-datepicker": "^3.8.0",
+    "react-dom": "^17.0.2",
+    "react-icons": "^5.5.0",
+    "react-leaflet": "^3.2.5",
+    "react-scripts": "^5.0.1"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/seuusuario/life-clinic-poc.git"
+  },
+  "author": "Seu Nome",
+  "license": "MIT"
+}
