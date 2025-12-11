@@ -221,9 +221,10 @@ if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
 
     const headers = {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+      'Access-Control-Allow-Origin': '*',  // Permite S3 origin
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token',  // Preflight headers
+      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,DELETE',  // Inclui mais
+      'Access-Control-Allow-Credentials': 'false'  // Se não usa cookies
     };
 
     if (method === 'OPTIONS') {

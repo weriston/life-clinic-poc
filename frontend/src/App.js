@@ -5,6 +5,15 @@ import 'react-datepicker/dist/react-datepicker.css';
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 
+// Função para URL dinâmica: local usa localhost:3001, production usa API Gateway
+const getApiUrl = (endpoint) => {
+  if (window.location.hostname === 'localhost') {
+    return `http://localhost:3001${endpoint}`;  // Local dev: Backend Python
+  } else {
+    return `https://47atlgbcke.execute-api.us-east-1.amazonaws.com/prod${endpoint}`;  // Production: Lambda via Gateway
+  }
+};
+
 function App() {
   // Hooks no top
   const [view, setView] = useState('home');
@@ -16,7 +25,7 @@ function App() {
 
   useEffect(() => {
     if (view === 'insumos') {
-      fetch('http://localhost:3001/api/insumos')
+      fetch(getApiUrl('/api/insumos'))
         .then(res => res.json())
         .then(result => setInsumos(result.insumos || []))
         .catch(() => setInsumos([]));
@@ -27,7 +36,7 @@ function App() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      const response = await fetch('http://localhost:3001/api/recomendar', {
+      const response = await fetch(getApiUrl('/api/recomendar'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
@@ -60,7 +69,7 @@ function App() {
 
   const handleConfirmar = async () => {
     try {
-      const response = await fetch('http://localhost:3001/api/agendar', {
+      const response = await fetch(getApiUrl('/api/agendar'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
