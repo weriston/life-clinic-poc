@@ -1,40 +1,130 @@
-# Life Clinic POC
+# Life Clinic — Proof of Concept (POC)
 
-Plataforma digital para tratamento de infertilidade com IA para rede de acolhimento inteligente. Este é um POC (Proof of Concept) completo, desenvolvido buscando atender ao escopo definido. Foco em inovação "Lovable" (IA simples e escalável), web-first, compliant LGPD (dados mock anonimizados).
+Este repositório contém uma prova de conceito desenvolvida para demonstrar arquitetura, engenharia de software, boas práticas em cloud e integração com IA.  
+O objetivo é materializar uma aplicação web simples, porém completa, contemplando:
 
-# Deploy & Arquitetura (POC)
+- Frontend Web responsivo
+- Backend serverless
+- Integração com IA (mock)
+- Infraestrutura totalmente automatizada via CLI
+- Documentação técnica e diagramas
 
-## Overview
-POC serverless com:
-- Frontend React hospedado em S3 (origin privada)
-- CloudFront (HTTPS) distribuindo frontend
-- API Gateway (REST) + Lambda (Node.js) como backend
-- IAM roles mínimos, logs em CloudWatch
+---
 
-## Pré-requisitos
-- AWS CLI v2 configurado (`aws configure`)
-- jq, zip, openssl
-- Node.js / npm (para build frontend)
+## 🚀 Arquitetura Geral da Solução
 
-## Comandos principais
-- Deploy/update: `bash deploy.sh`
-- Destroy: `bash deploy.sh --destroy --force`
+A aplicação segue uma arquitetura **serverless**, priorizando baixo custo, segurança e simplicidade de operação.
 
-## Segurança / boas práticas explicadas
-- Bucket privado, apenas CloudFront lê via OAI
-- IAM role com policy mínima (`AWSLambdaBasicExecutionRole`)
-- Não commit de credenciais no repositório (`.gitignore` pronto)
-- Variáveis sensíveis detectadas em runtime via `aws sts get-caller-identity`
+### Componentes
+- **S3** → hospeda o frontend React (arquivos estáticos)
+- **CloudFront** → distribuição global, HTTPS, cache e segurança
+- **API Gateway (REST)** → expõe o endpoint `/api/recomendar`
+- **AWS Lambda (Node.js)** → backend sem servidores
+- **IAM** → controle de permissões mínimo
+- **CloudWatch Logs** → observabilidade do backend
 
-## Slides / Diagrama (apresentação)
-- Diagrama de contexto (usuário -> CloudFront -> API -> Lambda -> IA)
-- Diagrama de infra (S3, CloudFront, API Gateway, Lambda, IAM, CloudWatch)
-- Argumente: custo baixo, facilidade de deploy, segurança (OAI), observabilidade.
+### Diagrama de Contexto
+![Context Diagram](docs/context-diagram.png)
 
-## Dicas para a entrevista
-- Demonstre a capacidade de automação (deploy.sh)
-- Explique tradeoffs: CloudFront aumenta custo levemente mas entrega HTTPS e segurança; sem CloudFront, S3 website é HTTP only.
-- Mostre o README + scripts no GitHub: é prova de trabalho reprodutível.
+### Diagrama de Infraestrutura
+![Infra Diagram](docs/infra-diagram.png)
 
+---
 
-Autor: Weriston Castro Alves | Data: Dezembro 2025 | Contato: weristonsp@gmail.com para dúvidas.
+## 🧩 Fluxo da Aplicação
+
+1. O usuário acessa o domínio HTTPS do CloudFront  
+2. CloudFront busca os arquivos estáticos no S3 (origin privada protegida por OAI)  
+3. O frontend comunica via `POST /api/recomendar` com o API Gateway  
+4. API Gateway invoca a Lambda  
+5. A Lambda processa a recomendação com um modelo IA simplificado (mock)  
+6. O resultado retorna ao navegador
+
+---
+
+## 🛠 Tecnologias Utilizadas
+
+| Camada | Tecnologia |
+|--------|------------|
+| Frontend | React (create-react-app) |
+| Backend | Node.js 18 (Lambda) |
+| API | AWS API Gateway |
+| Infra | AWS CLI, CloudFormation implícito, bash scripts |
+| Observabilidade | CloudWatch Logs |
+| Segurança | IAM Least Privilege + OAI |
+
+---
+
+## 🔐 Segurança & Boas Práticas
+
+- **Bucket S3 privado**: não exposto publicamente.  
+- **CloudFront + OAI**: apenas CloudFront acessa o S3.  
+- **HTTPS obrigatório**: melhoria para produção, mesmo em free-tier.  
+- **IAM mínimo**: Lambda usa apenas `AWSLambdaBasicExecutionRole`.  
+- **Sem credenciais no repo**: `.gitignore` otimizado.  
+- **Sem exposição de AWS Account ID**: scripts carregam o valor dinamicamente via `aws sts get-caller-identity`.
+
+---
+
+## 📦 Deploy Automático
+
+O arquivo `deploy.sh` executa:
+
+1. Build do frontend  
+2. Criação e configuração do bucket S3  
+3. Upload dos artefatos do frontend  
+4. Criação do pacote da Lambda  
+5. Criação do API Gateway  
+6. Deploy automático da infraestrutura  
+
+### Comando principal:
+
+```bash
+bash deploy.sh
+
+```
+### Destruir tudo:
+
+```bash
+bash deploy.sh --destroy --force
+
+```
+
+### Rodando Localmente:
+```bash
+cd frontend
+npm install
+npm start
+
+```
+
+### Backend (mock)
+
+```bash
+cd backend
+node server.js
+
+```
+
+## 📊 Custos Estimados (Free Tier Friendly)
+
+- ** S3: centavos/mês
+- ** CloudFront: gratuito no primeiro TB
+- ** Lambda: 1M execuções gratuitas
+- ** API Gateway: gratuito até certo volume
+- ** Custo total: praticamente zero durante o POC.
+
+### Estrutura do repositório
+
+```bash
+/backend
+/frontend
+/docs
+deploy.sh
+.gitignore
+README.md
+
+```
+
+### Autor
+Weriston Castro Alves
