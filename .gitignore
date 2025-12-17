@@ -31,4 +31,17 @@ apis/
 .idea/
 
 # Local docs if private
-lista-completa-de-arquivos.txt
+*.txt
+docs/
+
+# Untracked files
+--function-name
+--payload
+API
+Proxy
+Static
+cf.json
+cleanup-apigw.sh
+destroy-tudo.sh
+"Análise"
+

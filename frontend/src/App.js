@@ -4,23 +4,35 @@ import DatePicker from 'react-datepicker';
 import 'react-datepicker/dist/react-datepicker.css';
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
+import './App.css'; // <<-- ESTA LINHA FOI ADICIONADA AQUI
 
-// Função para URL dinâmica: local usa localhost:3001, production usa API Gateway
+/**
+ * API base injetada no build (deploy.sh)
+ * remove barra final para evitar //api
+ */
+const API_BASE = process.env.REACT_APP_API_URL
+  ? process.env.REACT_APP_API_URL.replace(/\/$/, '')
+  : '';
+
+/**
+ * Resolve URL da API:
+ * - localhost → backend local (3001)
+ * - produção → API Gateway
+ */
 const getApiUrl = (endpoint) => {
   if (window.location.hostname === 'localhost') {
-    return `http://localhost:3001${endpoint}`;  // Local dev: Backend Python
-  } else {
-    return `https://47atlgbcke.execute-api.us-east-1.amazonaws.com/prod${endpoint}`;  // Production: Lambda via Gateway
+    return `http://localhost:3001${endpoint}`;
   }
+  return `${API_BASE}${endpoint}`;
 };
 
 function App() {
   // Hooks no top
   const [view, setView] = useState('home');
   const [data, setData] = useState({ idade: '', localizacao: '', especialidade: '' });
-  const [recomendacao, setRecomendacao] = useState(null);
+  const [recomendacao, setRecomendacao] = useState(null); // <<-- Estado que controla a exibição do card
   const [selectedSpecialist, setSelectedSpecialist] = useState(null);
-  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [selectedDate, setSelectedDate] = useState(new Date()); 
   const [insumos, setInsumos] = useState([]);
 
   useEffect(() => {
@@ -35,30 +47,47 @@ function App() {
   // Handlers
   const handleSubmit = async (e) => {
     e.preventDefault();
+    console.log('Botão Recomendar clicado. Dados:', data);
     try {
       const response = await fetch(getApiUrl('/api/recomendar'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
       });
+  
+      console.log('Resposta do Fetch recebida:', response); 
+      
+      if (!response.ok) { 
+          const errorText = await response.text();
+          console.error('Erro HTTP na requisição:', response.status, response.statusText, errorText);
+          setRecomendacao(`Erro do servidor: ${response.status} - ${errorText}`);
+          return;
+      }
+  
       const result = await response.json();
+      console.log('JSON da resposta do Backend (Recomendar):', result); // &lt;&lt;-- Log mais específico
+      
       if (result.error) {
         setRecomendacao('Erro na recomendação. Verifique backend.');
+        console.error('Erro reportado pelo backend:', result.error); 
         return;
       }
-      setRecomendacao(result.recomendacao);  // String full para card
+
+      setRecomendacao(result.nome); 
+
       setSelectedSpecialist({
         name: result.nome,
         specialty: result.especialidade,
         location: result.localizacao,
-        city: result.cidade,
+        city: result.cidade, 
         similarity: result.similaridade,
-        lat: result.lat,
-        lng: result.lng,
-        bio: result.bio
+        lat: result.lat,     
+        lng: result.lng,     
+        bio: result.bio      
       });
       // Fica em matching para ver lovable card
     } catch (error) {
+      console.error('Erro de conexão ou processamento (Recomendar):', error); // &lt;&lt;-- Log mais específico
       setRecomendacao('Erro de conexão: Backend em localhost:3001?');
     }
   };
@@ -69,6 +98,7 @@ function App() {
 
   const handleConfirmar = async () => {
     try {
+      console.log('Confirmando agendamento para:', selectedSpecialist ? selectedSpecialist.name : 'Especialista', 'em', selectedDate.toLocaleDateString('pt-BR')); // &lt;&lt;-- Novo log
       const response = await fetch(getApiUrl('/api/agendar'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -78,14 +108,28 @@ function App() {
           especialista: selectedSpecialist ? selectedSpecialist.name : 'Especialista'
         })
       });
+
+      console.log('Resposta do Fetch recebida (Agendar):', response); // &lt;&lt;-- Novo log
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Erro HTTP na requisição (Agendar):', response.status, response.statusText, errorText);
+        alert(`Erro no agendamento: ${response.status} - ${errorText}`);
+        return;
+      }
+
       const result = await response.json();
+      console.log('JSON da resposta do Backend (Agendar):', result); // &lt;&lt;-- Novo log
+
       if (result.success) {
         alert(`Agendado! ID: ${result.agendamento.id}\nData: ${result.agendamento.data} às ${result.agendamento.hora}`);
         setView('home');
       } else {
-        alert('Erro no agendamento.');
+        // Se o backend enviar success: false ou um erro específico
+        alert(result.message || 'Erro no agendamento.'); 
       }
     } catch (error) {
+      console.error('Erro de conexão ou processamento (Agendar):', error); // &lt;&lt;-- Novo log
       alert(`Erro: ${error.message}. Backend rodando?`);
     }
   };
@@ -94,24 +138,7 @@ function App() {
   if (view === 'home') {
     return (
       <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif', maxWidth: '500px', margin: '0 auto', background: '#F5F6F8' }}>
-        {/* Keyframes CSS para animações (inline, sem arquivo extra) */}
-        <style>{`
-          @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-          }
-          @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-          }
-          @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.05); }
-          }
-          .lovable-anim { animation: fadeIn 0.5s ease-out; }
-          .spin { animation: spin 1.5s linear infinite; }
-          .pulse { animation: pulse 2s infinite; }
-        `}</style>
+        {/* Keyframes CSS agora em App.css */} {/* <<-- ESTE COMENTÁRIO SUBSTITUIU O BLOCO <STYLE> */}
         <div style={{ textAlign: 'center', margin: '20px 0' }}>
           <img src="/logo-life-clinic.svg" alt="Life Clinic Logo" style={{ width: '120px', height: 'auto', display: 'block', margin: '0 auto' }} />
         </div>
@@ -156,7 +183,7 @@ function App() {
           <button type="submit" style={{ width: '100%', padding: '10px', background: '#007bff', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Recomendar</button>
         </form>
         {/* Lovable card com animações e comments em {} */}
-        {recomendacao ? (
+        {recomendacao ? ( // <<-- ESTA CONDIÇÃO É ATIVADA QUANDO 'recomendacao' TEM UM VALOR (result.nome)
           <div className="lovable-anim" style={{ marginTop: '20px' }}>
             <div style={{ 
               padding: '20px', 

@@ -1,491 +1,476 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# deploy.sh 
-# - Idempotente (create/update)
-# - Suporta --destroy para remover infra criada
-# - Usa aws cli, jq, zip
-# - Detecta account/region via sts / aws configure
-# - Cria: S3 (private), CloudFront (HTTPS), Lambda, IAM role, API Gateway (REST), bucket policy, invalidation
-# - Packs backend into ZIP (includes ia/ by default)
-# - Safe: no hardcoded account ids in repo. Uses runtime detection.
-
-# REQUIREMENTS:
-# - aws cli v2 configured (aws configure)
-# - jq
-# - zip
-# - openssl (for simple key generation if needed)
-# - You must run from repo root
-
-# Usage:
-#   bash deploy.sh            # deploy/create/update
-#   bash deploy.sh --destroy  # destroy created infra (use carefully)
-#   bash deploy.sh --help
+# deploy.sh - CI/CD Final para Life Clinic POC
+# v4.1.28
+# - APRIMORAMENTO: Limpeza abrangente de todos os métodos HTTP (GET, POST, PUT, DELETE, PATCH, OPTIONS)
+#   antes de configurar o método ANY, tornando o script ainda mais robusto e idempotente
+#   contra configurações residuais ou intervenções manuais anteriores.
+# - FIX CRÍTICO FINAL: Utilização do método ANY no API Gateway para cada rota.
+#   Isso garante que todas as requisições HTTP (incluindo OPTIONS) sejam
+#   roteadas para a Lambda, resolvendo o problema "Missing Authentication Token"
+#   e permitindo que o Express/CORS na Lambda tratem o preflight corretamente.
+# - Removidas todas as configurações de OPTIONS, put-integration-response e
+#   put-method-response para o API Gateway, pois o método ANY combinado com
+#   o Express/CORS na Lambda simplifica e corrige o fluxo.
+# - FIX FINAL CRÍTICO: Corrigido erro "unbound variable" movendo a definição
+#   da variável METHOD para antes de sua primeira utilização no log, garantindo
+#   que ela esteja sempre definida.
+# - FIX FINAL E CRÍTICO: Tratamento idempotente para 'aws lambda add-permission'
+#   com `2>/dev/null || true`, resolvendo o ResourceConflictException
+#   e permitindo que o script seja executado múltiplas vezes sem falhas.
+# - FIX FINAL E CRÍTICO: Remoção de todas as configurações de CORS dos métodos GET/POST
+#   no API Gateway (put-integration-response, put-method-response) devido ao uso
+#   de Lambda Proxy Integration (AWS_PROXY). A responsabilidade pelo CORS
+#   para GET/POST é da função Lambda (Express).
+# - NEW: Adição da variável de ambiente CLOUDFRONT_FRONTEND_URL na Lambda
+#   para que o backend Node.js possa configurar o CORS do Express dinamicamente.
+# - FIX CRÍTICO: Correção da sintaxe de heredoc (revertendo &lt; para <).
+# - FIX CRÍTICO: Tratamento idempotente do 'ConflictException' em `put-method` na API Gateway.
+#   Reintroduzido `|| true` APENAS para os comandos `aws apigateway put-method`,
+#   permitindo que o script continue e depure erros nos comandos de configuração de CORS
+#   (put-integration-response, put-method-response).
+# - FIX CRÍTICO: Removido '--no-cli-pager' para compatibilidade com versões mais antigas do AWS CLI.
+#   Mantido o modo de depuração ativado (erros agora serão exibidos no terminal).
+# - FIX: CORS automatizado na API Gateway para métodos OPTIONS, GET, POST.
+#   Configura cabeçalhos Access-Control-Allow-Origin, Methods, Headers.
+# - FIX: Geração do JSON do CloudFront CustomErrorResponses.ResponseCode como string.
+# - FIX: Manipulação do JSON do CloudFront DistributionConfig mais robusta.
+# - FIX: Sintaxe heredoc (`cat <<EOF`) verificada e ajustada para garantir `<<` literal.
+# - NEW: Integração e gerenciamento do CloudFront (cria/atualiza origem, invalida cache)
+# - FIX: Adicionado log [7/7] para a seção final de OUTPUT
+# - FIX: Resolvido ResourceConflictException aguardando Lambda após update-function-code
+# - FIX: Ajuste na função wait_for_lambda para verificar LastUpdateStatus
+# - FIX: Aumenta Timeout e Memory da Lambda (verificado no update)
+# - FIX: Garante inclusão da pasta 'ia/' na Lambda (verificado no zip)
+# - Adiciona Bucket Policy para acesso público do S3
+# - FIX: Injeção de REACT_APP_API_URL no build do frontend
+# - FIX: função log()
+# - FIX: criação de bucket em us-east-1
+# - REST API v1 idempotente
+# - Lambda handler consistente (server.handler)
+# - Cleanup de permissões antigas (ajustado para melhor idempotência)
+# - Compatível Free Tier
 
 AWS_CLI=${AWS_CLI:-aws}
-JQ=${JQ:-jq}
 ZIP=${ZIP:-zip}
-OPENSSL=${OPENSSL:-openssl}
+DEPLOY_LOG="deploy.log"
 
-# ---------------------------
-# Args
-# ---------------------------
-DESTROY=false
-FORCE=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --destroy) DESTROY=true; shift ;;
-    --force) FORCE=true; shift ;;
-    --help) echo "Usage: $0 [--destroy] [--force]"; exit 0 ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
-  esac
-done
-
-# ---------------------------
-# Auto detect environment
-# ---------------------------
-AWS_REGION=$($AWS_CLI configure get region || echo "")
-if [[ -z "$AWS_REGION" ]]; then
-  echo "[ERROR] AWS region not set. Run: aws configure"
-  exit 1
-fi
-
-AWS_ACCOUNT_ID=$($AWS_CLI sts get-caller-identity --query Account --output text)
-if [[ -z "$AWS_ACCOUNT_ID" ]]; then
-  echo "[ERROR] Cannot detect AWS account id"
-  exit 1
-fi
-
-TIMESTAMP=$(date +%s)
-STACK_TAG="lifeclinic-poc"
-LAMBDA_NAME=${LAMBDA_NAME:-"manual-backend-function"}
-LAMBDA_HANDLER=${LAMBDA_HANDLER:-"backend/server.handler"}
-LAMBDA_RUNTIME=${LAMBDA_RUNTIME:-"nodejs18.x"}
-LAMBDA_ROLE_NAME=${LAMBDA_ROLE_NAME:-"${STACK_TAG}-lambda-role"}
-BUCKET_NAME=${BUCKET_NAME:-"lifeclinic-frontend-${AWS_ACCOUNT_ID}"}
-CF_COMMENT="LifeClinic POC CloudFront distribution"
-API_NAME=${API_NAME:-"Life Clinic API"}
-STAGE_NAME=${STAGE_NAME:-"prod"}
-CLOUDFRONT_LOG_BUCKET=${CLOUDFRONT_LOG_BUCKET:-""} # optional
-
-# Files
-BACKEND_ZIP="../backend-lambda.zip"   # relative to backend dir; will be created
-BACKEND_DIR="./backend"
-FRONTEND_DIR="./frontend/build"
-DEPLOY_LOG="./deploy-output.log"
-
-echo "[INFO] Deploy starting - account=$AWS_ACCOUNT_ID region=$AWS_REGION" | tee -a $DEPLOY_LOG
-
-# ---------------------------
-# Helper funcs
-# ---------------------------
-function awsjson() {
-  # wrapper to call aws and parse json safely
-  $AWS_CLI "$@" --output json
+# ===== LOG =====
+log() {
+  echo "[INFO] $1" | tee -a "$DEPLOY_LOG"
 }
 
-# ---------------------------
-# Destroy flow
-# ---------------------------
-if [[ "$DESTROY" == "true" ]]; then
-  echo "[WARN] Destroy mode. This will remove resources created by this script (Lambda, API GW, CloudFront, S3 bucket policy/distribution)."
-  if [[ "$FORCE" != "true" ]]; then
-    read -p "Type 'DESTROY' to proceed: " CONF
-    if [[ "$CONF" != "DESTROY" ]]; then
-      echo "Aborting."
-      exit 1
+# ===== PRÉ-REQUISITOS =====
+command -v jq >/dev/null || { echo "[ERROR] jq não instalado. Por favor, instale-o (ex: brew install jq ou sudo apt-get install jq)"; exit 1; }
+
+# ===== CONTEXTO AWS =====
+AWS_REGION=${AWS_REGION:-$($AWS_CLI configure get region 2>/dev/null || echo "us-east-1")}
+AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-$($AWS_CLI sts get-caller-identity --query Account --output text 2>/dev/null || echo "")}
+[[ -z "$AWS_ACCOUNT_ID" ]] && { echo "[ERROR] AWS account não detectada"; exit 1; }
+
+# ===== STACK =====
+STACK_TAG="lifeclinic-poc"
+LAMBDA_NAME="manual-backend-function"
+LAMBDA_HANDLER="backend/index.handler"
+LAMBDA_RUNTIME="nodejs18.x"
+LAMBDA_ROLE_NAME="${STACK_TAG}-lambda-role"
+BUCKET_NAME="lifeclinic-frontend-${AWS_ACCOUNT_ID}"
+API_NAME="Life Clinic API"
+STAGE_NAME="prod"
+
+# --- CONFIGURAÇÕES DA LAMBDA ---
+LAMBDA_TIMEOUT=30 # Aumentado para 30 segundos para acomodar cold start e IA Python
+LAMBDA_MEMORY=512 # Aumentado para 512 MB para acomodar dependências Python
+# --- FIM DAS CONFIGURAÇÕES DA LAMBDA ---
+
+# --- CONFIGURAÇÕES CLOUDFRONT ---
+CLOUDFRONT_DISTRIBUTION_ID="ER8KK22BLY7IB" # ID da sua distribuição CloudFront
+CLOUDFRONT_ORIGIN_ID="S3-${BUCKET_NAME}" # ID lógico da origem no CloudFront
+CLOUDFRONT_ORIGIN_DOMAIN="${BUCKET_NAME}.s3.amazonaws.com" # Domínio do bucket S3
+CLOUDFRONT_URL="https://d1c2ebdnb5ff4l.cloudfront.net" # URL para output (sem barra final para CORS)
+# --- FIM DAS CONFIGURAÇÕES CLOUDFRONT ---
+
+
+log "Deploy iniciado — Conta: $AWS_ACCOUNT_ID | Região: $AWS_REGION"
+
+# ===== HELPERS =====
+wait_for_lambda() {
+  local name=$1 elapsed=0
+  while true; do
+    # Consulta o estado e o status da última atualização da Lambda
+    status_info=$($AWS_CLI lambda get-function --function-name "$name" --query '{State: Configuration.State, LastUpdateStatus: Configuration.LastUpdateStatus}' --output json 2>/dev/null || echo '{"State": "Pending", "LastUpdateStatus": "InProgress"}')
+    state=$(echo "$status_info" | jq -r '.State')
+    last_update_status=$(echo "$status_info" | jq -r '.LastUpdateStatus')
+
+    # Considera a Lambda ativa apenas quando o estado é 'Active' E não está em 'InProgress' de uma atualização
+    if [[ "$state" == "Active" && "$last_update_status" != "InProgress" ]]; then
+      log "Lambda '$name' está Ativa."
+      return 0
     fi
-  fi
+    log "Aguardando Lambda '$name' ficar Ativa (Estado: $state, Último Update: $last_update_status)... ($elapsed s)"
+    [[ $elapsed -ge 300 ]] && { echo "[ERROR] Timeout: Lambda '$name' não ficou ativa após 300 segundos."; exit 1; }
+    sleep 10; elapsed=$((elapsed+10))
+  done
+}
 
-  # 1) Find API by name and delete
-  API_ID=$($AWS_CLI apigateway get-rest-apis --query "items[?name=='${API_NAME}'].id | [0]" --output text || echo "")
-  if [[ -n "$API_ID" ]]; then
-    echo "[DESTROY] Deleting API Gateway $API_ID"
-    $AWS_CLI apigateway delete-rest-api --rest-api-id "$API_ID"
-  fi
+wait_for_cloudfront_deployment() {
+  local dist_id=$1 elapsed=0
+  log "Aguardando CloudFront Deployment de '$dist_id' completar..."
+  while true; do
+    status=$($AWS_CLI cloudfront get-distribution --id "$dist_id" --query 'Distribution.Status' --output text)
+    if [[ "$status" == "Deployed" ]]; then
+      log "CloudFront Deployment de '$dist_id' completo."
+      return 0
+    fi
+    [[ $elapsed -ge 600 ]] && { echo "[ERROR] Timeout: CloudFront deployment não completou após 600 segundos."; exit 1; }
+    sleep 20; elapsed=$((elapsed+20))
+  done
+}
 
-  # 2) Delete Lambda function
-  if $AWS_CLI lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
-    echo "[DESTROY] Deleting Lambda $LAMBDA_NAME"
-    $AWS_CLI lambda delete-function --function-name "$LAMBDA_NAME"
-  fi
+cleanup_old_permissions() {
+  local lambda_name=$1
+  local api_id=$2
 
-  # 3) Delete IAM role (detach policies)
-  ROLE_ARN=$($AWS_CLI iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
-  if [[ -n "$ROLE_ARN" ]]; then
-    echo "[DESTROY] Deleting IAM role $LAMBDA_ROLE_NAME"
-    # detach policies
-    for arn in $($AWS_CLI iam list-attached-role-policies --role-name "$LAMBDA_ROLE_NAME" --query 'AttachedPolicies[].PolicyArn' --output text || echo ""); do
-      $AWS_CLI iam detach-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-arn "$arn"
-    done
-    $AWS_CLI iam delete-role --role-name "$LAMBDA_ROLE_NAME" || true
-  fi
+  local current_api_source_arn="arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${api_id}/*/*/*"
 
-  # 4) CloudFront distributions created by this script are searched by comment
-  DIST_ID=$($AWS_CLI cloudfront list-distributions --query "DistributionList.Items[?Comment=='${CF_COMMENT}'].Id | [0]" --output text 2>/dev/null || echo "")
-  if [[ -n "$DIST_ID" && "$DIST_ID" != "None" ]]; then
-    echo "[DESTROY] Disabling CloudFront distribution $DIST_ID"
-    ETag=$($AWS_CLI cloudfront get-distribution-config --id "$DIST_ID" --query 'ETag' --output text)
-    CFG=$($AWS_CLI cloudfront get-distribution-config --id "$DIST_ID" --output json)
-    # patch to disable
-    $AWS_CLI cloudfront update-distribution \
-      --id "$DIST_ID" \
-      --if-match "$ETag" \
-      --distribution-config "$(echo $CFG | $JQ 'del(.ETag) | .DistributionConfig | .Enabled = false')"
-    echo "[DESTROY] Waiting 10s for disabled state"
-    sleep 10
-    # delete
-    $AWS_CLI cloudfront delete-distribution --id "$DIST_ID" --if-match "$ETag" || true
-  fi
+  policy_json=$($AWS_CLI lambda get-policy \
+    --function-name "$lambda_name" \
+    --query Policy \
+    --output text 2>/dev/null || echo "")
 
-  # 5) Remove bucket policy (but not the bucket itself)
-  if $AWS_CLI s3api get-bucket-policy --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
-    echo "[DESTROY] Deleting bucket policy on $BUCKET_NAME"
-    $AWS_CLI s3api delete-bucket-policy --bucket "$BUCKET_NAME"
-  fi
+  [[ -z "$policy_json" || "$policy_json" == "None" ]] && return 0
 
-  # 6) Optionally remove bucket website config
-  if $AWS_CLI s3api get-bucket-website --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
-    echo "[DESTROY] Deleting bucket website config"
-    $AWS_CLI s3api delete-bucket-website --bucket "$BUCKET_NAME"
-  fi
+  echo "$policy_json" | jq -c '.Statement[]' | while read -r stmt; do
+    sid=$(echo "$stmt" | jq -r '.Sid')
 
-  echo "[DESTROY] Done."
-  exit 0
-fi
+    # Extrai o SourceArn da permissão, se existir
+    src_arn_from_policy=$(echo "$stmt" | jq -r '
+      .Condition.ArnLike
+      | to_entries[]
+      | select(.key=="AWS:SourceArn")
+      | .value
+    ' 2>/dev/null || echo "")
 
-# ---------------------------
-# 1) Build & upload frontend
-# ---------------------------
-echo "[1/12] Build frontend (if react project)"
-if [[ -d "./frontend" ]]; then
-  pushd frontend >/dev/null
-  if [[ -f package.json ]]; then
-    echo "[INFO] Running frontend build..."
-    npm run build
-  fi
-  popd >/dev/null
-fi
+    # Remove permissões cujo SourceArn não corresponda ao SourceArn da API atual
+    # ou que não contenham o API_ID atual em seu Statement ID (para pegar resquícios de SIDs antigos)
+    if [[ -n "$sid" && ("$src_arn_from_policy" != "$current_api_source_arn" || ! "$sid" =~ "apigw-${api_id}") ]]; then
+      log "Removendo permissão Lambda antiga: $sid (SourceArn: $src_arn_from_policy, Esperado: $current_api_source_arn)"
+      $AWS_CLI lambda remove-permission \
+        --function-name "$lambda_name" \
+        --statement-id "$sid" 2>/dev/null || true
+    fi
+  done
+}
 
-# create bucket if not exists
+
+# ===== [1/7] S3 Bucket Setup =====
+log "[1/7] S3 Bucket Setup"
 if ! $AWS_CLI s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
-  echo "[2/12] Creating S3 bucket $BUCKET_NAME"
   if [[ "$AWS_REGION" == "us-east-1" ]]; then
-    $AWS_CLI s3api create-bucket --bucket "$BUCKET_NAME" --region "$AWS_REGION"
+    $AWS_CLI s3api create-bucket --bucket "$BUCKET_NAME"
   else
-    $AWS_CLI s3api create-bucket --bucket "$BUCKET_NAME" --create-bucket-configuration LocationConstraint="$AWS_REGION" --region "$AWS_REGION"
+    $AWS_CLI s3api create-bucket \
+      --bucket "$BUCKET_NAME" \
+      --region "$AWS_REGION" \
+      --create-bucket-configuration LocationConstraint="$AWS_REGION"
   fi
+  log "Bucket S3 '$BUCKET_NAME' criado em $AWS_REGION."
 else
-  echo "[2/12] Bucket $BUCKET_NAME exists"
+  log "Bucket S3 '$BUCKET_NAME' já existe em $AWS_REGION."
 fi
 
-# ---------------------------
-# 2) Make bucket private and upload build
-# ---------------------------
-echo "[3/12] Configure bucket (private origin - CloudFront)"
-# remove public access block if present (we want to serve via CloudFront)
-if $AWS_CLI s3api get-public-access-block --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
-  $AWS_CLI s3api delete-public-access-block --bucket "$BUCKET_NAME"
-fi
-
-# apply private ACL (owner only)
-$AWS_CLI s3api put-bucket-acl --bucket "$BUCKET_NAME" --acl private
-
-# sync files with cache header defaults (index.html no-cache)
-echo "[3.1] Uploading frontend files with cache-control rules"
-# index.html -> no-cache
-$AWS_CLI s3 cp frontend/build/index.html s3://$BUCKET_NAME/index.html \
-  --cache-control "no-cache, max-age=0" --acl private
-# static assets -> long cache
-$AWS_CLI s3 sync frontend/build/ s3://$BUCKET_NAME/ --exclude "index.html" \
-  --cache-control "max-age=31536000, public" --acl private
-
-# set website config (for fallback only, CloudFront origin uses s3 bucket not website)
-$AWS_CLI s3api put-bucket-website --bucket "$BUCKET_NAME" --website-configuration '{
-  "IndexDocument": {"Suffix": "index.html"},
-  "ErrorDocument": {"Key": "index.html"}
-}'
-
-# ---------------------------
-# 3) Create IAM role for Lambda (least privilege)
-# ---------------------------
-echo "[4/12] Ensure IAM role for Lambda exists: $LAMBDA_ROLE_NAME"
-ROLE_ARN=$($AWS_CLI iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || echo "")
-if [[ -z "$ROLE_ARN" ]]; then
-  cat > /tmp/trust-policy.json <<EOF
+# --- BUCKET POLICY PARA ACESSO PÚBLICO ---
+log "Configurando Bucket Policy para acesso público ao S3 '$BUCKET_NAME'..."
+BUCKET_POLICY_JSON=$(cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "",
       "Effect": "Allow",
-      "Principal": { "Service": "lambda.amazonaws.com" },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}
-EOF
-  $AWS_CLI iam create-role --role-name "$LAMBDA_ROLE_NAME" --assume-role-policy-document file:///tmp/trust-policy.json
-  # attach managed policy for basic lambda execution + cloudwatch
-  $AWS_CLI iam attach-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  ROLE_ARN=$($AWS_CLI iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text)
-  echo "[INFO] Created role $LAMBDA_ROLE_NAME ($ROLE_ARN)"
-else
-  echo "[INFO] Role $LAMBDA_ROLE_NAME exists ($ROLE_ARN)"
-fi
-
-# ---------------------------
-# 4) Package backend lambda
-# ---------------------------
-echo "[5/12] Packaging backend Lambda"
-pushd backend >/dev/null
-# clean and create zip
-rm -f ../backend-lambda.zip
-# make sure node_modules included if you want to run in lambda; otherwise user must include dependencies
-$ZIP -r ../backend-lambda.zip . -x "*.git*" "node_modules/*" || true
-# If you need to include node_modules, uncomment:
-# $ZIP -r ../backend-lambda.zip . -x "*.git*"
-popd >/dev/null
-echo "[INFO] Built $BACKEND_ZIP"
-
-# ---------------------------
-# 5) Create or update Lambda
-# ---------------------------
-echo "[6/12] Create or update Lambda function: $LAMBDA_NAME"
-if $AWS_CLI lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
-  echo "[INFO] Updating function code"
-  $AWS_CLI lambda update-function-code --function-name "$LAMBDA_NAME" --zip-file fileb://$BACKEND_ZIP
-  $AWS_CLI lambda update-function-configuration --function-name "$LAMBDA_NAME" --handler "$LAMBDA_HANDLER" --runtime "$LAMBDA_RUNTIME" --role "$ROLE_ARN"
-else
-  echo "[INFO] Creating function"
-  $AWS_CLI lambda create-function --function-name "$LAMBDA_NAME" \
-    --runtime "$LAMBDA_RUNTIME" \
-    --handler "$LAMBDA_HANDLER" \
-    --role "$ROLE_ARN" \
-    --zip-file fileb://$BACKEND_ZIP \
-    --timeout 15 --memory-size 256
-fi
-LAMBDA_ARN=$($AWS_CLI lambda get-function --function-name "$LAMBDA_NAME" --query 'Configuration.FunctionArn' --output text)
-
-# ---------------------------
-# 6) API Gateway REST (idempotent)
-# ---------------------------
-echo "[7/12] Ensure API Gateway REST: $API_NAME"
-API_ID=$($AWS_CLI apigateway get-rest-apis --query "items[?name=='${API_NAME}'].id | [0]" --output text || echo "")
-if [[ -z "$API_ID" || "$API_ID" == "None" ]]; then
-  API_ID=$($AWS_CLI apigateway create-rest-api --name "$API_NAME" --description "API for Life Clinic POC" --query 'id' --output text)
-  echo "[INFO] Created API: $API_ID"
-else
-  echo "[INFO] Found existing API: $API_ID"
-fi
-
-ROOT_ID=$($AWS_CLI apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id" --output text)
-# create resource /api if not exist
-API_RESOURCE_API=$($AWS_CLI apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/api'].id | [0]" --output text || echo "")
-if [[ -z "$API_RESOURCE_API" || "$API_RESOURCE_API" == "None" ]]; then
-  API_RESOURCE_API=$($AWS_CLI apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part api --query 'id' --output text)
-  echo "[INFO] Created resource /api -> $API_RESOURCE_API"
-fi
-
-ensure_method_and_integration() {
-  local resource_id=$1
-  local http_method=$2
-  local lambda_arn=$3
-  # create method if not exists
-  if ! $AWS_CLI apigateway get-method --rest-api-id $API_ID --resource-id $resource_id --http-method $http_method >/dev/null 2>&1; then
-    $AWS_CLI apigateway put-method --rest-api-id $API_ID --resource-id $resource_id --http-method $http_method --authorization-type "NONE"
-  fi
-  # put integration (aws_proxy)
-  if ! $AWS_CLI apigateway get-integration --rest-api-id $API_ID --resource-id $resource_id --http-method $http_method >/dev/null 2>&1; then
-    $AWS_CLI apigateway put-integration --rest-api-id $API_ID --resource-id $resource_id --http-method $http_method \
-      --type AWS_PROXY \
-      --integration-http-method POST \
-      --uri "arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${lambda_arn}/invocations"
-  else
-    echo "[INFO] Integration exists for ${http_method} on ${resource_id}"
-  fi
-  # add lambda permission for this API & method
-  SID="apigw-${API_ID}-${resource_id}-${http_method}"
-  SOURCE_ARN="arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/${http_method}/*"
-  # Try add-permission idempotently (catch error)
-  set +e
-  $AWS_CLI lambda add-permission --function-name "$LAMBDA_NAME" --statement-id "$SID" --action lambda:InvokeFunction --principal apigateway.amazonaws.com --source-arn "$SOURCE_ARN" >/dev/null 2>&1
-  set -e
-}
-
-# create /api/recomendar
-RES_RECOMENDAR=$($AWS_CLI apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/api/recomendar'].id | [0]" --output text || echo "")
-if [[ -z "$RES_RECOMENDAR" || "$RES_RECOMENDAR" == "None" ]]; then
-  RES_RECOMENDAR=$($AWS_CLI apigateway create-resource --rest-api-id $API_ID --parent-id $API_RESOURCE_API --path-part recomendar --query 'id' --output text)
-fi
-
-# create /api/agendar
-RES_AGENDAR=$($AWS_CLI apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/api/agendar'].id | [0]" --output text || echo "")
-if [[ -z "$RES_AGENDAR" || "$RES_AGENDAR" == "None" ]]; then
-  RES_AGENDAR=$($AWS_CLI apigateway create-resource --rest-api-id $API_ID --parent-id $API_RESOURCE_API --path-part agendar --query 'id' --output text)
-fi
-
-# create /api/insumos
-RES_INSUMOS=$($AWS_CLI apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/api/insumos'].id | [0]" --output text || echo "")
-if [[ -z "$RES_INSUMOS" || "$RES_INSUMOS" == "None" ]]; then
-  RES_INSUMOS=$($AWS_CLI apigateway create-resource --rest-api-id $API_ID --parent-id $API_RESOURCE_API --path-part insumos --query 'id' --output text)
-fi
-
-# ensure POST/OPTIONS for recomendar
-ensure_method_and_integration "$RES_RECOMENDAR" "POST" "$LAMBDA_ARN"
-# add mock OPTIONS to handle CORS
-if ! $AWS_CLI apigateway get-method --rest-api-id $API_ID --resource-id $RES_RECOMENDAR --http-method OPTIONS >/dev/null 2>&1; then
-  $AWS_CLI apigateway put-method --rest-api-id $API_ID --resource-id $RES_RECOMENDAR --http-method OPTIONS --authorization-type "NONE"
-  $AWS_CLI apigateway put-integration --rest-api-id $API_ID --resource-id $RES_RECOMENDAR --http-method OPTIONS --type MOCK --request-templates '{"application/json":"{}"}' --passthrough-behavior WHEN_NO_MATCH
-  $AWS_CLI apigateway put-method-response --rest-api-id $API_ID --resource-id $RES_RECOMENDAR --http-method OPTIONS --status-code 200 --response-models '{"application/json":"Empty"}' --response-parameters "method.response.header.Access-Control-Allow-Origin=true" "method.response.header.Access-Control-Allow-Headers=true" "method.response.header.Access-Control-Allow-Methods=true"
-  $AWS_CLI apigateway put-integration-response --rest-api-id $API_ID --resource-id $RES_RECOMENDAR --http-method OPTIONS --status-code 200 --response-templates '{"application/json": ""}' --response-parameters "{\"method.response.header.Access-Control-Allow-Origin\":\"'*\",\"method.response.header.Access-Control-Allow-Headers\":\"'Content-Type,Authorization'\",\"method.response.header.Access-Control-Allow-Methods\":\"'POST,OPTIONS'\"}"
-fi
-
-# ensure GET for insumos (and OPTIONS)
-ensure_method_and_integration "$RES_INSUMOS" "GET" "$LAMBDA_ARN"
-if ! $AWS_CLI apigateway get-method --rest-api-id $API_ID --resource-id $RES_INSUMOS --http-method OPTIONS >/dev/null 2>&1; then
-  $AWS_CLI apigateway put-method --rest-api-id $API_ID --resource-id $RES_INSUMOS --http-method OPTIONS --authorization-type "NONE"
-  $AWS_CLI apigateway put-integration --rest-api-id $API_ID --resource-id $RES_INSUMOS --http-method OPTIONS --type MOCK --request-templates '{"application/json":"{}"}' --passthrough-behavior WHEN_NO_MATCH
-  $AWS_CLI apigateway put-method-response --rest-api-id $API_ID --resource-id $RES_INSUMOS --http-method OPTIONS --status-code 200 --response-models '{"application/json":"Empty"}' --response-parameters "method.response.header.Access-Control-Allow-Origin=true" "method.response.header.Access-Control-Allow-Headers=true" "method.response.header.Access-Control-Allow-Methods=true"
-  $AWS_CLI apigateway put-integration-response --rest-api-id $API_ID --resource-id $RES_INSUMOS --http-method OPTIONS --status-code 200 --response-templates '{"application/json": ""}' --response-parameters "{\"method.response.header.Access-Control-Allow-Origin\":\"'*\",""method.response.header.Access-Control-Allow-Headers\":\"'Content-Type,Authorization'\",\"method.response.header.Access-Control-Allow-Methods\":\"'GET,OPTIONS'\"}"
-fi
-
-# ensure POST for agendar (and OPTIONS)
-ensure_method_and_integration "$RES_AGENDAR" "POST" "$LAMBDA_ARN"
-if ! $AWS_CLI apigateway get-method --rest-api-id $API_ID --resource-id $RES_AGENDAR --http-method OPTIONS >/dev/null 2>&1; then
-  $AWS_CLI apigateway put-method --rest-api-id $API_ID --resource-id $RES_AGENDAR --http-method OPTIONS --authorization-type "NONE"
-  $AWS_CLI apigateway put-integration --rest-api-id $API_ID --resource-id $RES_AGENDAR --http-method OPTIONS --type MOCK --request-templates '{"application/json":"{}"}' --passthrough-behavior WHEN_NO_MATCH
-  $AWS_CLI apigateway put-method-response --rest-api-id $API_ID --resource-id $RES_AGENDAR --http-method OPTIONS --status-code 200 --response-models '{"application/json":"Empty"}' --response-parameters "method.response.header.Access-Control-Allow-Origin=true" "method.response.header.Access-Control-Allow-Headers=true" "method.response.header.Access-Control-Allow-Methods=true"
-  $AWS_CLI apigateway put-integration-response --rest-api-id $API_ID --resource-id $RES_AGENDAR --http-method OPTIONS --status-code 200 --response-templates '{"application/json": ""}' --response-parameters "{\"method.response.header.Access-Control-Allow-Origin\":\"'*\",""method.response.header.Access-Control-Allow-Headers\":\"'Content-Type,Authorization'\",\"method.response.header.Access-Control-Allow-Methods\":\"'POST,OPTIONS'\"}"
-fi
-
-# Deploy the API
-echo "[8/12] Deploying API to stage $STAGE_NAME"
-$AWS_CLI apigateway create-deployment --rest-api-id $API_ID --stage-name $STAGE_NAME >/dev/null
-
-API_INVOKE_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/${STAGE_NAME}"
-echo "[INFO] API URL: $API_INVOKE_URL"
-
-# ---------------------------
-# 7) CloudFront (HTTPS + origin access)
-# ---------------------------
-echo "[9/12] CloudFront setup (private S3 origin + HTTPS)"
-# Create Origin Access Identity (OAI)
-OAI_ID=$($AWS_CLI cloudfront list-cloud-front-origin-access-identities --query "CloudFrontOriginAccessIdentityList.Items[?Comment=='${STACK_TAG}'].Id | [0]" --output text 2>/dev/null || echo "")
-if [[ -z "$OAI_ID" || "$OAI_ID" == "None" ]]; then
-  OAI_JSON=$($AWS_CLI cloudfront create-cloud-front-origin-access-identity --cloud-front-origin-access-identity-config "CallerReference=${TIMESTAMP},Comment=${STACK_TAG}" --output json)
-  OAI_ID=$(echo "$OAI_JSON" | $JQ -r '.CloudFrontOriginAccessIdentity.Id')
-  OAI_S3_CANONICAL_USER=$(echo "$OAI_JSON" | $JQ -r '.CloudFrontOriginAccessIdentity.S3CanonicalUserId')
-  echo "[INFO] Created OAI $OAI_ID"
-else
-  OAI_S3_CANONICAL_USER=$($AWS_CLI cloudfront get-cloud-front-origin-access-identity --id "$OAI_ID" --query 'CloudFrontOriginAccessIdentity.S3CanonicalUserId' --output text)
-  echo "[INFO] Found OAI $OAI_ID"
-fi
-
-# Grant OAI read permission on bucket
-echo "[9.1] Granting OAI permission to read bucket objects"
-POLICY=$(cat <<EOF
-{
-  "Version":"2012-10-17",
-  "Statement":[
-    {
-      "Effect":"Allow",
-      "Principal":{"CanonicalUser":"$OAI_S3_CANONICAL_USER"},
-      "Action":"s3:GetObject",
-      "Resource":"arn:aws:s3:::${BUCKET_NAME}/*"
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::${BUCKET_NAME}/*"
     }
   ]
 }
 EOF
 )
-$AWS_CLI s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$POLICY"
+$AWS_CLI s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$BUCKET_POLICY_JSON"
+log "Bucket Policy configurada."
+# --- FIM BUCKET POLICY ---
 
-# Build CloudFront distribution config (basic)
-ORIGIN_ID="S3-${BUCKET_NAME}"
-DIST_ID=$($AWS_CLI cloudfront list-distributions --query "DistributionList.Items[?Comment=='${CF_COMMENT}'].Id | [0]" --output text 2>/dev/null || echo "")
-if [[ -z "$DIST_ID" || "$DIST_ID" == "None" ]]; then
-  echo "[9.2] Creating CloudFront distribution"
-  CALLER_REF="lc-${TIMESTAMP}"
-  read -r -d '' DIST_CONFIG <<EOF || true
-{
-  "CallerReference": "${CALLER_REF}",
-  "Comment": "${CF_COMMENT}",
-  "DefaultRootObject": "index.html",
-  "Enabled": true,
-  "Origins": {
-    "Quantity": 1,
-    "Items": [
-      {
-        "Id": "${ORIGIN_ID}",
-        "DomainName": "${BUCKET_NAME}.s3.amazonaws.com",
-        "S3OriginConfig": {
-          "OriginAccessIdentity": "origin-access-identity/cloudfront/${OAI_ID}"
-        }
-      }
-    ]
-  },
-  "DefaultCacheBehavior": {
-    "TargetOriginId": "${ORIGIN_ID}",
-    "ViewerProtocolPolicy": "redirect-to-https",
-    "AllowedMethods": {
-      "Quantity": 2,
-      "Items": ["GET","HEAD"]
-    },
-    "ForwardedValues": {
-      "QueryString": false,
-      "Cookies": {"Forward": "none"}
-    },
-    "MinTTL": 0,
-    "DefaultTTL": 3600,
-    "MaxTTL": 31536000
-  },
-  "ViewerCertificate": {
-    "CloudFrontDefaultCertificate": true
-  }
-}
-EOF
 
-  DIST_JSON=$($AWS_CLI cloudfront create-distribution --distribution-config "$DIST_CONFIG")
-  DIST_ID=$(echo "$DIST_JSON" | $JQ -r '.Distribution.Id')
-  DIST_DOMAIN=$(echo "$DIST_JSON" | $JQ -r '.Distribution.DomainName')
-  echo "[INFO] Created CloudFront dist: $DIST_ID ($DIST_DOMAIN)"
+# Não sincronizamos o frontend aqui ainda, será feito após o build com a URL da API.
+
+# ===== [2/7] IAM ROLE =====
+log "[2/7] IAM Role"
+ROLE_ARN=$($AWS_CLI iam get-role --role-name "$LAMBDA_ROLE_NAME" --query Role.Arn --output text 2>/dev/null || echo "")
+if [[ "$ROLE_ARN" == "None" || -z "$ROLE_ARN" ]]; then
+  log "Criando IAM Role: $LAMBDA_ROLE_NAME"
+  $AWS_CLI iam create-role \
+    --role-name "$LAMBDA_ROLE_NAME" \
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  $AWS_CLI iam attach-role-policy \
+    --role-name "$LAMBDA_ROLE_NAME" \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  sleep 15 # Espera para consistência eventual do IAM
+  ROLE_ARN=$($AWS_CLI iam get-role --role-name "$LAMBDA_ROLE_NAME" --query Role.Arn --output text)
+  log "IAM Role '$LAMBDA_ROLE_NAME' criado com ARN: $ROLE_ARN"
 else
-  echo "[9.2] Found existing CloudFront distribution $DIST_ID"
-  DIST_DOMAIN=$($AWS_CLI cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.DomainName' --output text)
+  log "IAM Role '$LAMBDA_ROLE_NAME' já existe com ARN: $ROLE_ARN"
 fi
 
-# ---------------------------
-# 8) Add Lambda permissions for API (already attempted in ensure_method_and_integration)
-# ---------------------------
-echo "[10/12] Ensure Lambda permissions for API Gateway"
-# Ensure policy entries exist for each method - done in ensure_method_and_integration
 
-# ---------------------------
-# 9) Invalidate CloudFront so latest assets are served
-# ---------------------------
-echo "[11/12] Creating CloudFront invalidation for /*"
-ETAG=$($AWS_CLI cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*" --query 'Invalidation.Id' --output text)
-echo "[INFO] Invalidation created: $ETAG"
+# ===== [3/7] LAMBDA =====
+log "[3/7] Lambda"
+# --- AJUSTE DO ZIP PARA INCLUIR A PASTA 'ia/' E MANTER ESTRUTURA PARA HANDLER ---
+log "Instalando dependências do backend..."
+pushd backend >/dev/null
+npm ci --silent || npm install --silent # Garante que as dependências do Node.js estejam instaladas
+popd >/dev/null
 
-# ---------------------------
-# 10) Output summary & write frontend env
-# ---------------------------
-CF_DOMAIN=$($AWS_CLI cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.DomainName' --output text)
-FRONTEND_URL="https://${CF_DOMAIN}"
-echo "[12/12] DEPLOY COMPLETED"
-echo "Frontend URL: $FRONTEND_URL"
-echo "API URL: $API_INVOKE_URL"
+log "Empacotando backend e scripts de IA para Lambda..."
+rm -f lambda.zip # Garante que o arquivo zip antigo seja removido
 
-cat > frontend/.env <<EOF
-REACT_APP_API_URL=${API_INVOKE_URL}
-REACT_APP_CLOUDFRONT_DOMAIN=${CF_DOMAIN}
-EOF
+# Zips the 'backend' folder (which contains server.js and its node_modules)
+# and the 'ia' folder, both from the project root.
+# This creates a zip with:
+# - backend/ (containing server.js and node_modules/)
+# - ia/ (containing ia_matching.py)
+# This structure correctly resolves path.join(__dirname, '../ia/ia_matching.py')
+log "Empacotando backend e scripts de IA para Lambda..."
+rm -f lambda.zip
 
-echo "[INFO] Wrote frontend/.env"
+pushd backend >/dev/null
+zip -qr ../lambda.zip .
+popd >/dev/null
 
-echo "---- DEPLOY OUTPUT ----" | tee -a $DEPLOY_LOG
-echo "Frontend: $FRONTEND_URL" | tee -a $DEPLOY_LOG
-echo "API: $API_INVOKE_URL" | tee -a $DEPLOY_LOG
-echo "CloudFront domain: $CF_DOMAIN" | tee -a $DEPLOY_LOG
+zip -qr lambda.zip ia
 
-exit 0
+# --- FIM DO AJUSTE DO ZIP ---
+
+
+if $AWS_CLI lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
+  log "Atualizando código da função Lambda existente: $LAMBDA_NAME"
+  $AWS_CLI lambda update-function-code --function-name "$LAMBDA_NAME" --zip-file fileb://lambda.zip
+  wait_for_lambda "$LAMBDA_NAME"
+  log "Código da função Lambda '$LAMBDA_NAME' atualizado."
+
+  log "Atualizando configuração da função Lambda: $LAMBDA_NAME (Timeout: ${LAMBDA_TIMEOUT}s, Memória: ${LAMBDA_MEMORY}MB)"
+  $AWS_CLI lambda update-function-configuration \
+    --function-name "$LAMBDA_NAME" \
+    --handler "$LAMBDA_HANDLER" \
+    --runtime "$LAMBDA_RUNTIME" \
+    --timeout "$LAMBDA_TIMEOUT" \
+    --memory-size "$LAMBDA_MEMORY" \
+    --environment "Variables={CLOUDFRONT_FRONTEND_URL=${CLOUDFRONT_URL}}" \
+    --output text
+  wait_for_lambda "$LAMBDA_NAME"
+  log "Configuração da função Lambda '$LAMBDA_NAME' atualizada."
+else
+  log "Criando nova função Lambda: $LAMBDA_NAME (Timeout: ${LAMBDA_TIMEOUT}s, Memória: ${LAMBDA_MEMORY}MB)"
+  $AWS_CLI lambda create-function \
+    --function-name "$LAMBDA_NAME" \
+    --runtime "$LAMBDA_RUNTIME" \
+    --handler "$LAMBDA_HANDLER" \
+    --role "$ROLE_ARN" \
+    --zip-file fileb://lambda.zip \
+    --timeout "$LAMBDA_TIMEOUT" \
+    --memory-size "$LAMBDA_MEMORY" \
+    --environment "Variables={CLOUDFRONT_FRONTEND_URL=${CLOUDFRONT_URL}}" \
+    --output text
+  wait_for_lambda "$LAMBDA_NAME"
+  log "Função Lambda '$LAMBDA_NAME' criada com timeout=${LAMBDA_TIMEOUT}s e memória=${LAMBDA_MEMORY}MB."
+fi
+
+LAMBDA_ARN=$($AWS_CLI lambda get-function --function-name "$LAMBDA_NAME" --query Configuration.FunctionArn --output text)
+
+
+# ===== [4/7] API GATEWAY (REST v1) =====
+log "[4/7] API Gateway"
+
+API_ID=$($AWS_CLI apigateway get-rest-apis --query "items[?name=='$API_NAME'].id | [0]" --output text)
+if [[ "$API_ID" == "None" || -z "$API_ID" ]]; then
+  API_ID=$($AWS_CLI apigateway create-rest-api --name "$API_NAME" --query id --output text)
+  log "API Gateway REST criada: $API_ID"
+else
+  log "API Gateway REST reutilizada: $API_ID"
+fi
+
+ROOT_ID=$($AWS_CLI apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/'].id | [0]" --output text)
+API_RES=$($AWS_CLI apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/api'].id | [0]" --output text)
+
+if [[ "$API_RES" == "None" || -z "$API_RES" ]]; then
+  API_RES=$($AWS_CLI apigateway create-resource --rest-api-id "$API_ID" --parent-id "$ROOT_ID" --path-part api --query id --output text)
+  log "Recurso /api criado com ID: $API_RES"
+else
+  log "Recurso /api já existe com ID: $API_RES"
+fi
+
+# Chamada para limpeza de permissões antes de adicionar as novas
+log "Iniciando limpeza de permissões Lambda antigas para $LAMBDA_NAME e API $API_ID..."
+cleanup_old_permissions "$LAMBDA_NAME" "$API_ID"
+log "Limpeza de permissões concluída."
+
+for route in insumos agendar recomendar; do
+  RID=$($AWS_CLI apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/api/$route'].id | [0]" --output text)
+  if [[ "$RID" == "None" || -z "$RID" ]]; then
+    RID=$($AWS_CLI apigateway create-resource --rest-api-id "$API_ID" --parent-id "$API_RES" --path-part "$route" --query id --output text)
+    log "Recurso /api/$route criado com ID: $RID"
+  else
+    log "Recurso /api/$route já existe com ID: $RID"
+  fi
+
+  # APRIMORAMENTO: Limpa todos os métodos HTTP conhecidos para esta rota
+  log "Removendo qualquer configuração de métodos HTTP pré-existente (GET, POST, PUT, DELETE, PATCH, OPTIONS) para /api/$route no API Gateway..."
+  for m in GET POST PUT DELETE PATCH OPTIONS; do
+    $AWS_CLI apigateway delete-method \
+      --rest-api-id "$API_ID" \
+      --resource-id "$RID" \
+      --http-method "$m" \
+      2>/dev/null || true # Ignora o erro se o método não existir
+  done
+
+  # Configurando método ANY para /api/$route
+  log "Configurando método ANY para /api/$route..."
+  $AWS_CLI apigateway put-method \
+    --rest-api-id "$API_ID" \
+    --resource-id "$RID" \
+    --http-method ANY \
+    --authorization-type NONE || true # Tratamento de ConflictException para idempotência
+
+  log "Configurando integração para /api/$route..."
+  $AWS_CLI apigateway put-integration \
+    --rest-api-id "$API_ID" \
+    --resource-id "$RID" \
+    --http-method ANY \
+    --type AWS_PROXY \
+    --integration-http-method POST \
+    --uri "arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations" \
+    --passthrough-behavior WHEN_NO_MATCH \
+    --timeout-in-millis 29000
+
+  # Nenhuma configuração de CORS no API Gateway. A Lambda (Express) é responsável.
+  # Removidas todas as chamadas put-integration-response e put-method-response para ANY
+
+  # Usamos um statement-id fixo por API_ID e rota para idempotência real
+  STATEMENT_ID="apigw-${API_ID}-${route}-permission"
+  log "Adicionando permissão Lambda para /api/$route com Statement ID: $STATEMENT_ID..."
+  $AWS_CLI lambda add-permission \
+    --function-name "$LAMBDA_NAME" \
+    --statement-id "$STATEMENT_ID" \
+    --action lambda:InvokeFunction \
+    --principal apigateway.amazonaws.com \
+    --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/*" \
+    2>/dev/null || true # Ignora o erro se a permissão já existir
+
+done
+
+log "Realizando deploy do API Gateway para o estágio '$STAGE_NAME'..."
+$AWS_CLI apigateway create-deployment \
+  --rest-api-id "$API_ID" \
+  --stage-name "$STAGE_NAME" \
+  --description "Deploy automático $(date)" >/dev/null
+log "Deploy do API Gateway concluído."
+
+API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/${STAGE_NAME}"
+log "API disponível em: $API_URL"
+
+
+# ===== [5/7] FRONTEND BUILD & S3 SYNC (Agora com a API_URL disponível) =====
+log "[5/7] Build frontend com URL da API"
+pushd frontend >/dev/null
+log "Instalando dependências do frontend..."
+npm ci --silent || npm install --silent # Garante que as dependências do React estejam instaladas
+log "Injetando REACT_APP_API_URL e construindo frontend..."
+# Exporta a variável de ambiente antes do build do React
+export REACT_APP_API_URL="$API_URL"
+npm run build --silent
+popd >/dev/null
+log "Build do frontend concluído."
+
+log "[5/7] Sincronizando frontend com S3 bucket '$BUCKET_NAME'"
+$AWS_CLI s3 sync frontend/build s3://$BUCKET_NAME/ --delete # --acl public-read REMOVIDO para compatibilidade com Bucket Object Ownership
+log "Sincronização do frontend com S3 concluída."
+
+
+# ===== [6/7] CLOUDFRONT CONFIGURATION AND INVALIDATION =====
+log "[6/7] CloudFront Configuration and Invalidation"
+
+# Obtém a configuração atual da distribuição CloudFront e o ETag
+DIST_RESPONSE=$($AWS_CLI cloudfront get-distribution-config --id "$CLOUDFRONT_DISTRIBUTION_ID")
+CURRENT_ETAG=$(echo "$DIST_RESPONSE" | jq -r '.ETag')
+# Extrai *apenas* o objeto DistributionConfig que o CLI espera para update
+# Isso já remove o ETag do nível superior
+DISTRIBUTION_CONFIG_BASE=$(echo "$DIST_RESPONSE" | jq '.DistributionConfig')
+
+# Monta o JSON para CustomErrorResponses separadamente para garantir tipos corretos
+CUSTOM_ERROR_RESPONSES_JSON=$(cat <<EOCER
+{
+  "Quantity": 2,
+  "Items": [
+    {"ErrorCode": 404, "ResponsePagePath": "/index.html", "ResponseCode": "200", "ErrorCachingMinTTL": 10},
+    {"ErrorCode": 403, "ResponsePagePath": "/index.html", "ResponseCode": "200", "ErrorCachingMinTTL": 10}
+  ]
+}
+EOCER
+)
+
+# Adiciona/Atualiza a origem S3
+S3_ORIGIN_JSON=$(cat <<EOS3O
+{
+  "Id": "${CLOUDFRONT_ORIGIN_ID}",
+  "DomainName": "${BUCKET_NAME}.s3.amazonaws.com",
+  "S3OriginConfig": {
+    "OriginAccessIdentity": ""
+  },
+  "CustomHeaders": {"Quantity": 0, "Items": []},
+  "OriginPath": ""
+}
+EOS3O
+)
+
+# Modifica o DISTRIBUTION_CONFIG_BASE para incluir as alterações desejadas
+MODIFIED_DISTRIBUTION_CONFIG=$(echo "$DISTRIBUTION_CONFIG_BASE" | jq \
+  --arg root_object "index.html" \
+  --argjson custom_errors "$CUSTOM_ERROR_RESPONSES_JSON" \
+  --argjson s3_origin "$S3_ORIGIN_JSON" \
+  '
+  .DefaultRootObject = $root_object |
+  .CustomErrorResponses = $custom_errors |
+  # Adiciona ou substitui a nossa origem S3 na lista de origens existentes
+  .Origins.Items |= (map(select(.Id != $s3_origin.Id)) + [$s3_origin]) |
+  .Origins.Quantity = (.Origins.Items | length) |
+  # Garante que o DefaultCacheBehavior aponte para a nossa origem S3
+  .DefaultCacheBehavior.TargetOriginId = $s3_origin.Id
+  '
+)
+
+
+# Agora, chama o update-distribution com o objeto DistributionConfig *modificado*
+$AWS_CLI cloudfront update-distribution \
+  --id "$CLOUDFRONT_DISTRIBUTION_ID" \
+  --distribution-config "$MODIFIED_DISTRIBUTION_CONFIG" \
+  --if-match "$CURRENT_ETAG" >/dev/null
+log "Distribuição CloudFront atualizada com nova origem e configurações. Aguardando deploy..."
+wait_for_cloudfront_deployment "$CLOUDFRONT_DISTRIBUTION_ID"
+
+# Invalidação do cache
+log "Invalidando cache do CloudFront para garantir conteúdo atualizado..."
+INVALIDATION_ID=$($AWS_CLI cloudfront create-invalidation \
+  --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+  --paths "/*" \
+  --query 'Invalidation.Id' --output text)
+log "Invalidação de cache iniciada (ID: $INVALIDATION_ID). Pode levar alguns minutos para propagar."
+
+
+# ===== [7/7] OUTPUT =====
+log "[7/7] Deploy finalizado com sucesso!"
+log "API: $API_URL"
+log "Lambda: $LAMBDA_ARN"
+log "Frontend S3 Bucket: s3://$BUCKET_NAME"
+log "CloudFront URL: https://d1c2ebdnb5ff4l.cloudfront.net/" # Adicionado a URL do CloudFront para referência
+
+rm -f lambda.zip
+log "Arquivos temporários limpos."

@@ -1,41 +1,82 @@
-const express = require('express');
-const { exec } = require('child_process');  // Usado só local (Python)
-const cors = require('cors');
-const path = require('path');
+// backend/server.js
 
-// Mock DBs (agendamentos array, insumos tabela com alerta)
+const express = require('express');
+const cors = require('cors');
+// const serverless = require('serverless-http'); // <-- REMOVA ESTA LINHA daqui
+const path = require('path');
+const { exec } = require('child_process');
+
+const app = express();
+
+/* =====================
+   CONFIGURAÇÕES GLOBAIS
+===================== */
+const CLOUDFRONT_FRONTEND_URL = process.env.CLOUDFRONT_FRONTEND_URL || 'http://localhost:3000';
+
+/* =====================
+   MIDDLEWARES
+===================== */
+
+app.use(cors({
+  origin: CLOUDFRONT_FRONTEND_URL,
+  methods: 'GET,POST,OPTIONS', // Inclua todos os métodos que sua API suporta
+  allowedHeaders: 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent',
+  credentials: true,
+  optionsSuccessStatus: 200
+}));
+
+app.use(express.json());
+
+/* =====================
+   MOCK DATA
+===================== */
+
 let agendamentos = [];
+
 const insumosMock = [
-  { item: 'FIV Kit', quantidade: 15, alerta: 'Baixo' },
-  { item: 'Hormônios', quantidade: 50, alerta: 'OK' }
+  { item: 'FIV Kit', quantidade: 15 },
+  { item: 'Hormônios FSH', quantidade: 50 },
+  { item: 'Hormônios LH', quantidade: 40 },
+  { item: 'Cateter de Transferência', quantidade: 25 },
+  { item: 'Meio de Cultura Embrionário', quantidade: 10 },
+  { item: 'Agulhas para Punção', quantidade: 80 },
+  { item: 'Pipetas de Micromanipulação', quantidade: 5 },
+  { item: 'Sondas de Ultrassom', quantidade: 12 },
+  { item: 'Anestésicos Locais', quantidade: 30 },
+  { item: 'Material de Coleta de Sêmen', quantidade: 60 },
+  { item: 'Crioprotetores', quantidade: 20 },
+  { item: 'Placas de Petri', quantidade: 100 },
+  { item: 'Seringas Estéreis', quantidade: 150 },
+  { item: 'Medicação Progesterona', quantidade: 70 },
+  { item: 'Meio de Congelamento de Óvulos', quantidade: 8 }
 ];
 
-// Função comum para /api/agendar
-function handleAgendar(data, hora, especialista) {
-  const id = Date.now();
-  agendamentos.push({ id, data, hora, especialista, status: 'confirmado' });
-  return { success: true, agendamento: { id, data, hora, especialista, message: 'Agendado com sucesso!' } };
-}
+/* =====================
+   HANDLERS
+===================== */
 
-// Função comum para /api/insumos
 function handleInsumos() {
-  const insumos = insumosMock.map(i => ({
-    ...i,
-    alerta: i.quantidade < 20 ? 'Baixo Estoque (IA: Prever demanda)' : 'OK'
-  }));
-  return { insumos };
+  return {
+    insumos: insumosMock.map(i => ({
+      ...i,
+      alerta: i.quantidade < 20 ? 'Baixo Estoque (IA)' : 'OK'
+    }))
+  };
 }
 
-// Função híbrida IA: Python local, JS Lambda (auto-detect env)
-async function handleRecomendar(idade, localizacao, especialidade) {
+function handleAgendar({ data, hora, especialista }) {
+  const id = Date.now();
+  const novoAgendamento = { id, data, hora, especialista };
+  agendamentos.push(novoAgendamento);
+  return { success: true, agendamento: novoAgendamento };
+}
+
+async function handleRecomendar({ idade, localizacao, especialidade }) {
   console.log('Input IA:', { idade, localizacao, especialidade });
 
-  // Detecta ambiente: Lambda usa JS (sem Python), local usa exec Python
   if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
-    // Lambda: JS mock com array 52 especialistas nacionais (de PDF/dados reais)
+    // Lambda: JS mock - Mantido para quando estiver em produção na Lambda
     console.log('Usando JS IA (Lambda mode)');
-
-    // Array de especialistas (52 total – baseado no seu input, mock POC, adicione reais de Desafio Líder PDF ou DB)
     const especialistasNacionais = [
       // AC - Acre (2)
       {"nome": "Dra. Acre", "especialidade": "Ginecologia", "localizacao": "AC", "cidade": "Rio Branco", "idade_min": 25, "idade_max": 50, "lat": -9.9747, "lng": -67.8060, "bio": "Especialista em ginecologia e pré-concepção em Rio Branco.", "vetor": ["ginecologia", "pre-concepcao", "saude reprodutiva", "AC", "Rio Branco", "infertilidade"]},
@@ -149,18 +190,14 @@ async function handleRecomendar(idade, localizacao, especialidade) {
       {"nome": "Dr. Tocantins", "especialidade": "Hormônios", "localizacao": "TO", "cidade": "Palmas", "idade_min": 24, "idade_max": 44, "lat": -10.1674, "lng": -48.3267, "bio": "Fertilidade em Palmas.", "vetor": ["hormonios", "tratamento", "TO", "Palmas", "fertilidade"]}
     ];
 
-    // Lógica matching: Filtro por especialidade + localizacao, similaridade = score * rand (0.6-0.99)
     const matches = especialistasNacionais.filter(s => s.especialidade === especialidade && s.localizacao.includes(localizacao));
     if (matches.length === 0) {
       throw new Error('Nenhum especialista encontrado para ' + especialidade + ' em ' + localizacao);
     }
-    const match = matches[0];  // Primeiro match (adicione cosine se múltiplos)
-    match.similaridade = 0.6 + Math.random() * 0.39;  // Mock 0.6-0.99 (baseado no seu vetor)
-
-    const recomendacaoStr = `${match.nome} - Especialista em ${match.especialidade} em ${match.cidade} (similaridade: ${match.similaridade.toFixed(2)})`;
+    const match = matches[0];
+    match.similaridade = 0.6 + Math.random() * 0.39; // Adiciona alguma variabilidade
 
     return {
-      recomendacao: recomendacaoStr,
       nome: match.nome,
       especialidade: match.especialidade,
       localizacao: match.localizacao,
@@ -172,12 +209,11 @@ async function handleRecomendar(idade, localizacao, especialidade) {
     };
 
   } else {
-    // Local: Usa Python exec (como antes, funciona no Mac)
+    // Local: usa Python script
     console.log('Usando Python IA (local mode)');
-
     const pythonScript = path.join(__dirname, '../ia/ia_matching.py');
     const command = `python3 "${pythonScript}" ${idade} "${localizacao}" "${especialidade}"`;
-    
+
     const { stdout, stderr } = await new Promise((resolve, reject) => {
       exec(command, { cwd: __dirname }, (error, stdout, stderr) => {
         if (error) {
@@ -188,18 +224,12 @@ async function handleRecomendar(idade, localizacao, especialidade) {
       });
     });
 
-    console.log('Python stdout:', stdout ? stdout.trim() : 'Vazio');
-    console.log('Python stderr:', stderr ? stderr.trim() : 'None');
-
     if (stderr) {
       throw new Error('Erro na IA Python local: ' + stderr);
     }
 
     const resultado = JSON.parse(stdout.trim());
-    const recomendacaoStr = `${resultado.nome} - Especialista em ${resultado.especialidade} em ${resultado.cidade} (similaridade: ${resultado.similaridade.toFixed(2)})`;
-
     return {
-      recomendacao: recomendacaoStr,
       nome: resultado.nome,
       especialidade: resultado.especialidade,
       localizacao: resultado.localizacao,
@@ -212,120 +242,70 @@ async function handleRecomendar(idade, localizacao, especialidade) {
   }
 }
 
-// Lambda Handler (serverless mode)
-if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
-  exports.handler = async (event, context) => {
-    const body = JSON.parse(event.body || '{}');
-    const resource = event.resource || event.path;
-    const method = event.httpMethod || 'POST';
+/* =====================
+   ROUTES
+===================== */
 
-    const headers = {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',  // Permite S3 origin
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token',  // Preflight headers
-      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,DELETE',  // Inclui mais
-      'Access-Control-Allow-Credentials': 'false'  // Se não usa cookies
-    };
-
-    if (method === 'OPTIONS') {
-      return { statusCode: 200, headers, body: '' };
-    }
-
-    try {
-      if (resource === '/api/recomendar' && method === 'POST') {
-        const { idade, localizacao, especialidade } = body;
-        const resultado = await handleRecomendar(idade, localizacao, especialidade);
-        return { statusCode: 200, headers, body: JSON.stringify(resultado) };
-
-      } else if (resource === '/api/agendar' && method === 'POST') {
-        const { data, hora, especialista } = body;
-        const resultado = handleAgendar(data, hora, especialista);
-        return { statusCode: 200, headers, body: JSON.stringify(resultado) };
-
-      } else if (resource === '/api/insumos' && method === 'GET') {
-        const resultado = handleInsumos();
-        return { statusCode: 200, headers, body: JSON.stringify(resultado) };
-
-      } else {
-        return { statusCode: 404, headers, body: JSON.stringify({ error: 'Endpoint not found' }) };
-      }
-    } catch (error) {
-      console.error('Lambda error:', error);
-      return {
-        statusCode: 500,
-        headers,
-        body: JSON.stringify({ error: 'Internal server error', details: error.message })
-      };
-    }
-  };
-} else {
-  // Local Express Server (roda com node server.js)
-  const app = express();
-  const PORT = 3001;
-
-  app.use(cors());
-  app.use(express.json());
-  app.use(express.static('public'));
-
-  // Endpoint /api/recomendar
-  app.post('/api/recomendar', async (req, res) => {
-    try {
-      const { idade, localizacao, especialidade } = req.body;
-      const resultado = await handleRecomendar(idade, localizacao, especialidade);
-      res.json(resultado);
-    } catch (error) {
-      console.error('Erro /api/recomendar:', error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Endpoint /api/agendar
-  app.post('/api/agendar', (req, res) => {
-    try {
-      const { data, hora, especialista } = req.body;
-      const resultado = handleAgendar(data, hora, especialista);
-      res.json(resultado);
-    } catch (error) {
-      console.error('Erro /api/agendar:', error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Endpoint /api/insumos
-  app.get('/api/insumos', (req, res) => {
-    try {
-      const resultado = handleInsumos();
-      res.json(resultado);
-    } catch (error) {
-      console.error('Erro /api/insumos:', error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Endpoint update insumos (de anterior)
-  app.post('/api/insumos/update', (req, res) => {
-    try {
-      const { item, quantidade } = req.body;
-      const idx = insumosMock.findIndex(i => i.item === item);
-      if (idx !== -1) {
-        insumosMock[idx].quantidade = quantidade;
-      }
-      res.json({ success: true });
-    } catch (error) {
-      console.error('Erro /api/insumos/update:', error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Serve React build (produção local opcional)
-  if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.join(__dirname, '../frontend/build')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, '../frontend/build/index.html'));
-    });
+app.get('/api/insumos', (req, res, next) => {
+  try {
+    res.json(handleInsumos());
+  } catch (e) {
+    next(e); // Passa o erro para o middleware de erro global
   }
+});
 
+app.post('/api/agendar', (req, res, next) => {
+  try {
+    res.json(handleAgendar(req.body));
+  } catch (e) {
+    next(e); // Passa o erro para o middleware de erro global
+  }
+});
+
+app.post('/api/recomendar', async (req, res, next) => {
+  try {
+    const { idade, localizacao, especialidade } = req.body;
+    const resultado = await handleRecomendar({ idade, localizacao, especialidade });
+    res.json(resultado);
+  } catch (e) {
+    next(e); // Passa o erro para o middleware de erro global
+  }
+});
+
+/* =====================
+   MIDDLEWARE DE ERRO GLOBAL (ULTIMO MIDDLEWARE)
+===================== */
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+
+  res.setHeader('Access-Control-Allow-Origin', CLOUDFRONT_FRONTEND_URL);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+  res.status(500).json({
+    error: 'Erro interno do servidor',
+    message: err.message || 'Ocorreu um erro inesperado.'
+  });
+});
+
+
+/* =====================
+   LOCAL EXECUTION
+===================== */
+
+if (require.main === module) {
+  const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
-    console.log(`Backend rodando em http://localhost:${PORT}`);
+    console.log(`Backend local em http://localhost:${PORT}`);
   });
 }
+
+
+
+
+
+// ESTE ARQUIVO APENAS DEFINE O APP.
+// A EXPORTAÇÃO DO HANDLER DA LAMBDA OCORRE NO 'backend/index.js'.
+// module.exports = app; // <-- ESTA LINHA DEVE SER REMOVIDA se não for usada para outros módulos.
+module.exports = {
+  app
+};
