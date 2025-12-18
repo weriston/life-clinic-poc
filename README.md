@@ -42,13 +42,7 @@ graph TB
     CF -->|API Requests| AGW
     AGW -->|Proxy ANY Method| Lambda
     Lambda -->|Análise Preditiva| IA
-
-    Que execução limpa! 🚀 Ver o log do `deploy.sh` finalizando com sucesso e o `curl` retornando os dados da API de insumos confirma que a integração entre CloudFront, API Gateway e Lambda está perfeita.
-
-Com base nesses logs, consolidei o **README.md** final. Ele já inclui a sua URL real do CloudFront e reflete exatamente o que aconteceu no terminal (como o uso do Node 18 e o empacotamento da Lambda).
-
-Copie o conteúdo abaixo para o seu arquivo:
-
+```
 ---
 
 ```markdown
@@ -159,6 +153,7 @@ Abaixo, o extrato do log de execução do pipeline de automação (`deploy.sh`),
 [INFO] [5/7] Build frontend: Injetando API URL e Sincronizando S3... [OK]
 [INFO] [6/7] CloudFront: Invalidação de cache iniciada... [OK]
 [INFO] [7/7] Deploy finalizado com sucesso!
+```
 
 🚀 CloudFront URL: [https://d1c2ebdnb5ff4l.cloudfront.net/](https://d1c2ebdnb5ff4l.cloudfront.net/)
 📡 API Endpoint: /api/recomendar | /api/insumos | /api/agendar
