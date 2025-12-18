@@ -45,7 +45,6 @@ graph TB
 ```
 ---
 
-```markdown
 # 🏥 Life Clinic — Proof of Concept (POC)
 
 Este repositório contém a Prova de Conceito (POC) da plataforma **Life Clinic**, desenvolvida para demonstrar uma arquitetura de alta fidelidade na **AWS**. O projeto foca em resolver a fragmentação na jornada de reprodução humana através de tecnologia **Serverless** e **Inteligência Artificial**.
