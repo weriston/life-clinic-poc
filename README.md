@@ -45,53 +45,6 @@ graph TB
 ```
 ---
 
-# 🏥 Life Clinic — Proof of Concept (POC)
-
-Este repositório contém a Prova de Conceito (POC) da plataforma **Life Clinic**, desenvolvida para demonstrar uma arquitetura de alta fidelidade na **AWS**. O projeto foca em resolver a fragmentação na jornada de reprodução humana através de tecnologia **Serverless** e **Inteligência Artificial**.
-
-## 🌐 Link da POC Viva
-Acesse a aplicação rodando em ambiente produtivo:
-👉 **[https://d1c2ebdnb5ff4l.cloudfront.net/](https://d1c2ebdnb5ff4l.cloudfront.net/)**
-
----
-
-## 🚀 Arquitetura Geral da Solução
-
-A solução prioriza o modelo **NoOps** e **FinOps**, garantindo escalabilidade infinita com custo operacional zero dentro do *AWS Free Tier*.
-
-### 🏗️ Diagrama de Infraestrutura Cloud (IaC)
-
-```mermaid
-graph TB
-    subgraph "Public Internet"
-        User((Paciente / Médico))
-    end
-
-    subgraph "AWS Cloud (Edge & Serverless)"
-        subgraph "Edge Location"
-            CF[Amazon CloudFront]
-        end
-
-        subgraph "Storage Layer"
-            S3[(Amazon S3)]
-            noteS3[Hospedagem SPA React]
-        end
-
-        subgraph "Compute Layer"
-            AGW[API Gateway]
-            Lambda[AWS Lambda Node.js]
-            IA[Smart Insumos IA Engine]
-        end
-    end
-
-    User -->|HTTPS/TLS| CF
-    CF -->|Static Content| S3
-    CF -->|API Requests| AGW
-    AGW -->|Proxy ANY Method| Lambda
-    Lambda -->|Análise Preditiva| IA
-
-```
-
 ## 🧩 Diferenciais Técnicos demonstrados no Deploy
 
 * **Smart Insumos (IA):** 🧠 Motor integrado que analisa o estoque e fornece alertas inteligentes via Lambda.
