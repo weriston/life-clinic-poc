@@ -108,7 +108,12 @@ Abaixo, o extrato do log de execução do pipeline de automação (`deploy.sh`),
 ```
 
 🚀 CloudFront URL: [https://d1c2ebdnb5ff4l.cloudfront.net/](https://d1c2ebdnb5ff4l.cloudfront.net/)
-📡 API Endpoint: /api/recomendar | /api/insumos | /api/agendar
+
+📡 API Endpoints: 
+    /api/recomendar 
+    /api/insumos
+    /api/agendar
+
 ---
 
 **Autor:** Weriston Castro Alves | Líder de Arquitetura de Soluções
