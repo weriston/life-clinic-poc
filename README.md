@@ -107,7 +107,15 @@ Abaixo, o extrato do log de execução do pipeline de automação (`deploy.sh`),
 [INFO] [7/7] Deploy finalizado com sucesso!
 ```
 
-<img src="https://drive.google.com/file/d/1UNjlIdvZ1RyrohNOuRhWsZ2Yb4apCMn7/view?usp=sharing" alt="Life Clinic" width="400"/>
+<img src="docs/ev-lifeclinic-1.png" alt="Life Clinic" width="400"/>
+
+<img src="docs/ev-lifeclinic-3.jpeg" alt="Life Clinic - Matching IA" width="400"/>
+
+<img src="docs/ev-lifeclinic-2.jpeg" alt="Life Clinic - Matching IA - Localization" width="400"/>
+
+<img src="docs/ev-lifeclinic-4.jpeg" alt="Life Clinic - Agendamento" width="400"/>
+
+<img src="docs/ev-lifeclinic-5.png" alt="Life Clinic - Insumos" width="400"/>
 
 
 
