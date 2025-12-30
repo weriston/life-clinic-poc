@@ -107,6 +107,10 @@ Abaixo, o extrato do log de execução do pipeline de automação (`deploy.sh`),
 [INFO] [7/7] Deploy finalizado com sucesso!
 ```
 
+<img src="https://drive.google.com/file/d/1UNjlIdvZ1RyrohNOuRhWsZ2Yb4apCMn7/view?usp=sharing" alt="Life Clinic" width="400"/>
+
+
+
 🚀 CloudFront URL: [https://d1c2ebdnb5ff4l.cloudfront.net/](https://d1c2ebdnb5ff4l.cloudfront.net/)
 
 📡 API Endpoints: 
